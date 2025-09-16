@@ -1,0 +1,224 @@
+import dgl
+import dgl.nn.pytorch as dglnn
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from dgl.nn.functional import edge_softmax
+
+class SafeAnchorEnhancer(nn.Module):
+    def __init__(self, feature_dim, num_anchors=20, temperature=0.1):
+        """
+        安全锚点特征增强模块
+        """
+        super(SafeAnchorEnhancer, self).__init__()
+        self.num_anchors = num_anchors
+        self.temperature = temperature
+        
+        # 锚点生成器 - 简单的线性变换
+        self.anchor_gen = nn.Sequential(
+            nn.Linear(feature_dim, feature_dim),
+            nn.ReLU()
+        )
+        
+        # 特征融合器 - 残差连接
+        self.fusion = nn.Sequential(
+            nn.Linear(feature_dim * 2, feature_dim),
+            nn.ReLU()
+        )
+        
+        # 初始化参数
+        self._init_weights()
+        
+    def _init_weights(self):
+        for m in self.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+    
+    def forward(self, node_feats):
+        """
+        安全特征增强
+        Args:
+            node_feats: 节点特征 [num_nodes, feature_dim]
+            
+        Returns:
+            增强后的节点特征 [num_nodes, feature_dim]
+        """
+        num_nodes = node_feats.size(0)
+        if num_nodes == 0:  # 处理空图情况
+            return node_feats
+        
+        # 1. 生成锚点特征 - 不依赖节点索引
+        anchor_feats = self.anchor_gen(node_feats)  # [num_nodes, feature_dim]
+        
+        # 2. 计算节点-锚点相似度
+        # 使用所有节点作为潜在锚点，但通过相似度加权
+        node_norm = F.normalize(node_feats, p=2, dim=1, eps=1e-8)
+        anchor_norm = F.normalize(anchor_feats, p=2, dim=1, eps=1e-8)
+        
+        # 相似度矩阵 [num_nodes, num_nodes]
+        sim_matrix = torch.mm(node_norm, anchor_norm.t())
+        
+        # 应用温度系数的softmax
+        attn_weights = F.softmax(sim_matrix / self.temperature, dim=1)
+        
+        # 3. 特征聚合 - 加权平均
+        aggregated = torch.mm(attn_weights, anchor_feats)  # [num_nodes, feature_dim]
+        
+        # 4. 特征融合 - 残差连接
+        combined = torch.cat([node_feats, aggregated], dim=1)
+        enhanced = self.fusion(combined)
+        
+        return enhanced
+
+
+class RPGNN(nn.Module):
+    def __init__(self, in_features, hidden_features, out_features, hop, n_rel, scales):
+        super().__init__()
+        emb_dim = in_features
+        self.conv_in = RPLayer(emb_dim, in_features, hidden_features, n_rel, scales)
+        self.conv_out = RPLayer(emb_dim, hidden_features, out_features, n_rel, scales)
+        self.hop = hop
+        if hop > 2:
+            self.conv_hidden = nn.ModuleList(
+                [RPLayer(emb_dim, hidden_features, hidden_features, n_rel, scales) for _ in range(hop - 2)])
+
+    def forward(self, blocks, x):
+        x = F.relu(self.conv_in(blocks[0], x))
+        if self.hop > 2:
+            for i, conv in enumerate(self.conv_hidden):
+                x = F.relu(conv(blocks[i + 1], x))
+        x = F.relu(self.conv_out(blocks[-1], x))
+        return x
+
+class RelationalPathGNN(nn.Module):
+    def __init__(self, g, ent2id, num_rel, parameter):
+        super(RelationalPathGNN, self).__init__()
+        self.ent2id_dict = ent2id
+        self.device = parameter['device']
+        self.hop = parameter['hop']
+        self.es = parameter['embed_dim']
+        self.g_batch = parameter['g_batch']
+        self.g = g
+        self.sampler = dgl.dataloading.MultiLayerFullNeighborSampler(parameter['hop'], prefetch_node_feats=['feat'],
+                                                                     prefetch_edge_feats=['feat', 'eid'])
+        scales = parameter.get('scales', [1,3,5])
+        self.gcn = RPGNN(self.es, self.es * 2, self.es, self.hop, num_rel, scales)
+        self.num_rel = num_rel
+
+    def ent2id(self, triples):
+        idx = [[[self.ent2id_dict[t[0]], self.ent2id_dict[t[2]]] for t in batch] for batch in triples]
+        idx = torch.LongTensor(idx).to(self.device)
+        return idx  # B * few * 2
+
+    def forward(self, triples):
+        '''
+        inputs:
+            task: Batch triplets, B * few
+        outputs:
+            emb: B * few * es
+        '''
+
+        idx = self.ent2id(triples)
+        batch_size, few_shot = idx.shape[0], idx.shape[1]
+        idx = idx.view(-1)
+        dataloader = dgl.dataloading.DataLoader(
+            self.g, idx, self.sampler,
+            batch_size=self.g_batch,
+            shuffle=False,
+            drop_last=False,
+            device=self.device,
+            use_uva=True)
+        out_emb = []
+        for input_nodes, output_nodes, blocks in dataloader:
+            input_features = blocks[0].srcdata['feat']
+            out_features = self.gcn(blocks, input_features)
+            out_emb.append(out_features)
+        out_emb = torch.cat(out_emb, dim=0)
+        out_emb = out_emb.view(batch_size, few_shot, 2, -1)
+        return out_emb
+
+
+class StochasticTwoLayerGCN(nn.Module):
+    def __init__(self, in_features, hidden_features, out_features):
+        super().__init__()
+        self.conv1 = dglnn.GraphConv(in_features, hidden_features, allow_zero_in_degree=True)
+        self.conv2 = dglnn.GraphConv(hidden_features, out_features, allow_zero_in_degree=True)
+
+    def forward(self, blocks, x):
+        x = F.relu(self.conv1(blocks[0], x))
+        x = F.relu(self.conv2(blocks[1], x))
+        return x
+
+
+class AdaptiveMultiScaleRelationModule(nn.Module):
+    def __init__(self, in_features, out_features, scales):
+        super(AdaptiveMultiScaleRelationModule, self).__init__()
+        self.scales = scales
+        self.linears = nn.ModuleList([nn.Linear(in_features, out_features) for _ in scales])
+        self.attn_fc = nn.Linear(out_features, 1, bias=False)
+
+    def forward(self, g, feat):
+        multi_scale_feats = [F.relu(linear(feat)) for linear in self.linears]
+        attn_scores = [self.attn_fc(feat) for feat in multi_scale_feats]
+        attn_scores = torch.stack(attn_scores, dim=-1)
+        attn_scores = F.softmax(attn_scores, dim=-1)
+        weighted_feats = [attn_scores[..., i] * multi_scale_feats[i] for i in range(len(self.scales))]
+        out_feat = torch.stack(weighted_feats, dim=-1).sum(dim=-1)
+        return out_feat
+
+class RPLayer(nn.Module):
+    def __init__(self, emb_dim, in_feat, out_feat, num_rels, scales):
+        super().__init__()
+        self.num_rels = num_rels
+        self.linear_r = dgl.nn.pytorch.TypedLinear(in_feat + emb_dim * 2, out_feat, num_rels)
+        self.attn_fc = nn.Linear(emb_dim + out_feat, 1, bias=False)
+        self.h_bias = nn.Parameter(torch.Tensor(out_feat))
+        self.loop_weight = nn.Parameter(torch.Tensor(emb_dim, out_feat))
+        self.amrm = AdaptiveMultiScaleRelationModule(out_feat, out_feat, scales)
+        
+        # 添加安全锚点增强模块
+        self.anchor_enhancer = SafeAnchorEnhancer(out_feat)
+        
+        nn.init.xavier_uniform_(self.loop_weight, gain=nn.init.calculate_gain('relu'))
+        nn.init.zeros_(self.h_bias)  # 初始化偏置项
+
+    def edge_agg(self, edges):
+        """Relation Message Passing"""
+        x = torch.cat([edges.src['h'], edges.data['feat'], edges.dst['feat']], dim=1)
+        m = self.linear_r(x, edges.data['eid'])
+        attn = F.leaky_relu(self.attn_fc(torch.cat([edges.dst['feat'], m], dim=1)))
+        return {'h': m, 'z': attn}
+
+    def forward(self, g, feat):
+        with g.local_scope():
+            # Norm
+            degs = g.out_degrees().float().clamp(min=1)
+            norm = torch.pow(degs, -0.5)
+            shp = norm.shape + (1,) * (feat.dim() - 1)
+            norm = torch.reshape(norm, shp)
+            feat = feat * norm
+            g.srcdata['h'] = feat
+            g.apply_edges(self.edge_agg)
+            e = g.edata.pop('z')
+            a = edge_softmax(g, e)
+            g.edata['h'] = a * g.edata['h']
+            g.update_all(dgl.function.copy_e('h', 'm'), dgl.function.sum('m', 'h'))
+            h = g.dstdata['h']
+            h = h + g.dstdata['feat'] @ self.loop_weight
+            # Norm 
+            degs = g.in_degrees().float().clamp(min=1)
+            norm = torch.pow(degs, -0.5)
+            shp = norm.shape + (1,) * (h.dim() - 1)
+            norm = torch.reshape(norm, shp)
+            rst = h * norm
+            h = rst + self.h_bias
+
+            # Adaptive Multi-Scale Relation Module
+            h = self.amrm(g, h)
+            
+            # 安全锚点特征增强 - 最后一步
+            h = self.anchor_enhancer(h)
+
+            return h
